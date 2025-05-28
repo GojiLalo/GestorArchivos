@@ -37,6 +37,7 @@ android {
     }
     kotlinOptions {
         jvmTarget = "11"
+        freeCompilerArgs += "-Xenable-experimental-feature=BreakContinueInInlineLambdas"
     }
 
     tasks.withType<KotlinCompile>().configureEach {

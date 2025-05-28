@@ -140,7 +140,7 @@ class FileManagerFragment : Fragment(), BluetoothService.BluetoothServiceListene
         }
     }
 
-    private fun navigateUp() {
+    fun navigateUp() {
         if (currentDirectory.absolutePath != Environment.getExternalStorageDirectory().absolutePath) {
             val parent = currentDirectory.parentFile
             if (parent != null && parent.canRead()) {

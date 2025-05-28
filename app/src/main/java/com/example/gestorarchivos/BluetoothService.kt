@@ -18,6 +18,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive // Importar isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -27,12 +28,9 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.UUID
+import android.os.Environment
 
-// UUID para el perfil SPP (Serial Port Profile), comúnmente usado para transferencias genéricas.
-// Si deseas usar OPP (Object Push Profile) nativo de Android, la implementación es más compleja
-// y a menudo implica el uso de la API de ContentResolver para interactuar con el sistema de intercambio de archivos.
-// Para este ejemplo, usaremos SPP para una implementación más directa de socket.
-val MY_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB") // UUID para SPP
+val MY_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 const val APP_NAME = "MiGestorDeArchivos"
 
 class BluetoothService(private val context: Context, private val uiHandler: Handler) {
@@ -43,12 +41,12 @@ class BluetoothService(private val context: Context, private val uiHandler: Hand
 
     private var connectThread: ConnectThread? = null
     private var connectedThread: ConnectedThread? = null
-    private var acceptThread: AcceptThread? = null // Hilo para el servidor
+    private var acceptThread: AcceptThread? = null
 
-    private var job: Job = Job()
-    private val coroutineScope = CoroutineScope(Dispatchers.IO + job)
+    // Usaremos un Job para controlar el ciclo de vida de las corrutinas en los hilos.
+    private var serviceJob = Job()
+    private val coroutineScope = CoroutineScope(Dispatchers.IO + serviceJob)
 
-    // Listener para eventos de Bluetooth
     interface BluetoothServiceListener {
         fun onDeviceFound(device: BluetoothDevice)
         fun onScanFinished()
@@ -58,7 +56,7 @@ class BluetoothService(private val context: Context, private val uiHandler: Hand
         fun onFileTransferStarted(fileName: String)
         fun onFileTransferProgress(fileName: String, progress: Int)
         fun onFileTransferComplete(fileName: String, success: Boolean)
-        fun onMessage(message: String) // Para mensajes de estado general
+        fun onMessage(message: String)
     }
 
     private var listener: BluetoothServiceListener? = null
@@ -67,7 +65,7 @@ class BluetoothService(private val context: Context, private val uiHandler: Hand
         this.listener = listener
     }
 
-    @SuppressLint("MissingPermission") // Los permisos se manejan en MainActivity
+    @SuppressLint("MissingPermission")
     fun startDiscovery() {
         if (bluetoothAdapter == null) {
             listener?.onMessage("Bluetooth no soportado en este dispositivo.")
@@ -76,11 +74,9 @@ class BluetoothService(private val context: Context, private val uiHandler: Hand
         if (bluetoothAdapter?.isDiscovering == true) {
             bluetoothAdapter?.cancelDiscovery()
         }
-        // Registra un BroadcastReceiver para escuchar dispositivos encontrados
         val filter = IntentFilter(BluetoothDevice.ACTION_FOUND)
         context.registerReceiver(discoveryReceiver, filter)
 
-        // Registra un BroadcastReceiver para escuchar cuando la búsqueda termina
         val endFilter = IntentFilter(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
         context.registerReceiver(discoveryReceiver, endFilter)
 
@@ -91,10 +87,13 @@ class BluetoothService(private val context: Context, private val uiHandler: Hand
     @SuppressLint("MissingPermission")
     fun cancelDiscovery() {
         bluetoothAdapter?.cancelDiscovery()
-        context.unregisterReceiver(discoveryReceiver) // Asegúrate de desregistrar
+        try {
+            context.unregisterReceiver(discoveryReceiver)
+        } catch (e: IllegalArgumentException) {
+            // Receiver no estaba registrado, ignorar
+        }
     }
 
-    // BroadcastReceiver para manejar dispositivos encontrados
     private val discoveryReceiver = object : BroadcastReceiver() {
         @SuppressLint("MissingPermission")
         override fun onReceive(context: Context, intent: Intent) {
@@ -103,46 +102,37 @@ class BluetoothService(private val context: Context, private val uiHandler: Hand
                 BluetoothDevice.ACTION_FOUND -> {
                     val device: BluetoothDevice? = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
                     device?.let {
-                        // Filtra dispositivos ya emparejados para no listarlos dos veces (opcional)
-                        // O simplemente lista todos
                         listener?.onDeviceFound(it)
                     }
                 }
                 BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
                     listener?.onScanFinished()
-                    context.unregisterReceiver(this) // Desregistrar el receiver una vez que termina
+                    try {
+                        context.unregisterReceiver(this) // Desregistrar el receiver una vez que termina
+                    } catch (e: IllegalArgumentException) {
+                        // Receiver ya fue desregistrado
+                    }
                 }
             }
         }
     }
 
-    /**
-     * Inicia el hilo de conexión para conectar a un dispositivo Bluetooth.
-     */
     @SuppressLint("MissingPermission")
     fun connect(device: BluetoothDevice) {
         listener?.onConnectionAttempt("Conectando a ${device.name ?: device.address}...")
-        // Cancelar cualquier intento de conexión existente
         connectThread?.cancel()
         connectThread = ConnectThread(device)
         connectThread?.start()
     }
 
-    /**
-     * Inicia el hilo del servidor para escuchar conexiones entrantes.
-     */
     @SuppressLint("MissingPermission")
     fun startAcceptingConnections() {
-        // Si ya hay un hilo de aceptación, cancelarlo
         acceptThread?.cancel()
         acceptThread = AcceptThread()
         acceptThread?.start()
         listener?.onMessage("Esperando conexiones entrantes...")
     }
 
-    /**
-     * Envía un archivo a través de la conexión Bluetooth activa.
-     */
     fun sendFile(file: File) {
         if (connectedThread != null) {
             connectedThread?.sendFile(file)
@@ -151,17 +141,14 @@ class BluetoothService(private val context: Context, private val uiHandler: Hand
         }
     }
 
-    /**
-     * Detiene todos los hilos y libera los recursos.
-     */
     fun stop() {
+        serviceJob.cancel() // Cancelar el Job principal, esto cancelará las corrutinas
         connectThread?.cancel()
-        connectThread = null
         connectedThread?.cancel()
-        connectedThread = null
         acceptThread?.cancel()
+        connectThread = null
+        connectedThread = null
         acceptThread = null
-        coroutineScope.cancel() // Cancelar el ámbito de las corrutinas
         try {
             context.unregisterReceiver(discoveryReceiver)
         } catch (e: IllegalArgumentException) {
@@ -169,27 +156,21 @@ class BluetoothService(private val context: Context, private val uiHandler: Hand
         }
     }
 
-    /**
-     * Hilo para conectar a un dispositivo Bluetooth como cliente.
-     */
     private inner class ConnectThread(private val device: BluetoothDevice) : Thread() {
         private val mmSocket: BluetoothSocket? by lazy(LazyThreadSafetyMode.NONE) {
-            // Intentar conectar a través de SPP (Serial Port Profile)
             @SuppressLint("MissingPermission")
             device.createRfcommSocketToServiceRecord(MY_UUID)
         }
 
         override fun run() {
-            // Siempre cancelar el descubrimiento porque ralentizará la conexión
             @SuppressLint("MissingPermission")
             bluetoothAdapter?.cancelDiscovery()
 
             mmSocket?.let { socket ->
                 try {
-                    // Conectarse al dispositivo a través del socket. Bloquea hasta que tiene éxito o lanza una excepción.
                     socket.connect()
                     manageConnectedSocket(socket, device)
-                    listener?.onConnected(device.name ?: device.address)
+                    uiHandler.post { listener?.onConnected(device.name ?: device.address) }
                 } catch (e: IOException) {
                     uiHandler.post {
                         listener?.onConnectionFailed(device.name ?: device.address, e.message ?: "Error de conexión.")
@@ -216,39 +197,47 @@ class BluetoothService(private val context: Context, private val uiHandler: Hand
         }
     }
 
-    /**
-     * Hilo para aceptar conexiones entrantes como servidor.
-     */
     private inner class AcceptThread : Thread() {
         private val mmServerSocket: BluetoothServerSocket? by lazy(LazyThreadSafetyMode.NONE) {
             @SuppressLint("MissingPermission")
             bluetoothAdapter?.listenUsingRfcommWithServiceRecord(APP_NAME, MY_UUID)
         }
 
+        private var running = true // Bandera para controlar el bucle
+
         override fun run() {
             var socket: BluetoothSocket? = null
-            // Mantenerse escuchando hasta que se obtenga una conexión o se cancele.
-            while (true) {
+            // Escuchar mientras el hilo de la coroutine esté activo Y la bandera sea true
+            while (running && coroutineScope.isActive) {
                 try {
-                    socket = mmServerSocket?.accept() // Bloquea hasta que se obtiene una conexión
+                    socket = mmServerSocket?.accept()
                 } catch (e: IOException) {
+                    // Si el server socket se cierra (e.g., por cancelación), se lanzará una excepción
+                    // Esto indica que el hilo debe terminar.
                     uiHandler.post {
-                        listener?.onMessage("Socket del servidor falló: ${e.message}")
+                        listener?.onMessage("Socket del servidor falló o fue cerrado: ${e.message}")
                     }
-                    break
+                    running = false // Salir del bucle
                 }
 
                 socket?.also {
                     manageConnectedSocket(it, it.remoteDevice)
-                    mmServerSocket?.close() // Cerrar el server socket una vez que se acepta la conexión
-                    break
+                    try {
+                        mmServerSocket?.close() // Cerrar el server socket una vez que se acepta la conexión
+                    } catch (e: IOException) {
+                        uiHandler.post {
+                            listener?.onMessage("Error al cerrar server socket después de aceptar: ${e.message}")
+                        }
+                    }
+                    running = false // Salir del bucle después de una conexión exitosa
                 }
             }
         }
 
         fun cancel() {
+            running = false // Establecer la bandera a false
             try {
-                mmServerSocket?.close()
+                mmServerSocket?.close() // Cerrar el socket para interrumpir el accept() bloqueante
             } catch (e: IOException) {
                 uiHandler.post {
                     listener?.onMessage("No se pudo cerrar el socket del servidor: ${e.message}")
@@ -257,52 +246,62 @@ class BluetoothService(private val context: Context, private val uiHandler: Hand
         }
     }
 
-    /**
-     * Inicia el ConnectedThread para manejar la transmisión de datos.
-     */
     private fun manageConnectedSocket(socket: BluetoothSocket, device: BluetoothDevice) {
-        // Cancelar el hilo de conexión porque ya hemos conectado
         connectThread?.cancel()
         connectThread = null
 
-        // Cancelar el hilo de aceptación porque solo queremos una conexión a la vez
-        acceptThread?.cancel()
+        acceptThread?.cancel() // Asegurarse de que el AcceptThread se detenga
         acceptThread = null
 
         connectedThread = ConnectedThread(socket)
         connectedThread?.start()
     }
 
-    /**
-     * Hilo para manejar la conexión y la transferencia de datos.
-     */
     private inner class ConnectedThread(private val mmSocket: BluetoothSocket) : Thread() {
         private val mmInStream: InputStream = mmSocket.inputStream
         private val mmOutStream: OutputStream = mmSocket.outputStream
         private val buffer = ByteArray(1024)
 
-        override fun run() {
-            // Escuchar el InputStream para mensajes entrantes
-            while (true) {
-                try {
-                    val bytes = mmInStream.read(buffer)
-                    val message = String(buffer, 0, bytes)
+        private var running = true // Bandera para controlar el bucle de lectura
 
-                    // Un simple protocolo: si el mensaje comienza con "FILE_NAME:", entonces es el nombre del archivo
-                    // Esto es muy básico, un protocolo real debería ser más robusto (tamaño, CRC, etc.)
+        // En ConnectedThread
+        override fun run() {
+            // Escuchar el InputStream para mensajes entrantes mientras la bandera sea true y la corrutina activa
+            while (running && coroutineScope.isActive) {
+                try {
+                    // Asumimos que los mensajes normales son cortos o terminados por un newline.
+                    // Para la transferencia de archivos, el primer mensaje SIEMPRE será el encabezado.
+                    // Puedes usar una estrategia para diferenciar mensajes de texto normales de encabezados de archivo.
+                    // Por ejemplo, un prefijo fijo para encabezados, o que todos los mensajes de texto también terminen con newline.
+                    // Para simplificar aquí, asumimos que "FILE_NAME:" es el primer mensaje.
+
+                    // Intenta leer el encabezado del archivo
+                    val message = readHeaderMessage() // Lee hasta el newline
+
                     if (message.startsWith("FILE_NAME:")) {
-                        val fileName = message.substringAfter("FILE_NAME:")
-                        receiveFile(fileName)
+                        // Si es un encabezado de archivo, llama a receiveFile con el encabezado completo
+                        receiveFile(message)
                     } else {
+                        // Si no es un encabezado de archivo, es un mensaje normal
                         uiHandler.post { listener?.onMessage("Mensaje recibido: $message") }
                     }
                 } catch (e: IOException) {
-                    uiHandler.post { listener?.onMessage("Dispositivo desconectado: ${e.message}") }
-                    break
+                    // Este es el error "read failed, socket might closed" que verías aquí.
+                    uiHandler.post {
+                        listener?.onMessage("Error de conexión al leer: ${e.message}. Conexión cerrada.")
+                    }
+                    running = false // Salir del bucle si hay un error en la lectura principal
+                } catch (e: InterruptedException) {
+                    uiHandler.post { listener?.onMessage("Lectura de hilo interrumpida: ${e.message}") }
+                    running = false // Salir del bucle si el hilo es interrumpido
+                } finally {
+                    // Asegurar que el socket se cierra si el bucle termina por cualquier razón (error o cancelación)
+                    cancel()
                 }
             }
         }
 
+        // En ConnectedThread
         @SuppressLint("MissingPermission")
         fun sendFile(file: File) {
             coroutineScope.launch {
@@ -312,33 +311,48 @@ class BluetoothService(private val context: Context, private val uiHandler: Hand
 
                 var fileInputStream: FileInputStream? = null
                 try {
-                    // Enviar el nombre del archivo primero (protocolo simple)
-                    val fileNameMessage = "FILE_NAME:${file.name}"
-                    mmOutStream.write(fileNameMessage.toByteArray())
+                    val fileName = file.name
+                    val fileSize = file.length() // Obtener el tamaño del archivo
+
+                    // **PROTOCOLO:** Enviar nombre y tamaño (por ejemplo, separados por '|')
+                    val headerMessage = "FILE_NAME:$fileName|FILE_SIZE:$fileSize"
+                    mmOutStream.write(headerMessage.toByteArray())
                     mmOutStream.flush()
-                    sleep(500) // Pequeña pausa para asegurar que el receptor procesa el nombre
+                    // No es necesario Thread.sleep(500) aquí, ya que el receptor leerá el tamaño y sabrá qué hacer.
 
                     fileInputStream = FileInputStream(file)
                     var bytesRead: Int
                     var totalBytesSent: Long = 0
-                    val totalSize = file.length()
+                    val bufferSize = 4096 // Un buffer más grande puede mejorar el rendimiento
+                    val sendBuffer = ByteArray(bufferSize) // Buffer para el envío
 
-                    while (fileInputStream.read(buffer).also { bytesRead = it } != -1) {
-                        mmOutStream.write(buffer, 0, bytesRead)
+                    while (fileInputStream.read(sendBuffer).also { bytesRead = it } != -1 && coroutineScope.isActive) {
+                        mmOutStream.write(sendBuffer, 0, bytesRead)
                         totalBytesSent += bytesRead
-                        val progress = ((totalBytesSent * 100) / totalSize).toInt()
+                        val progress = ((totalBytesSent * 100) / fileSize).toInt()
                         withContext(Dispatchers.Main) {
                             listener?.onFileTransferProgress(file.name, progress)
                         }
                     }
-                    mmOutStream.flush()
+                    mmOutStream.flush() // Asegurar que todos los bytes son enviados
+
+                    // Opcional: Podrías enviar un mensaje de "FIN_TRANSFERENCIA" si tu protocolo lo requiere
+                    // mmOutStream.write("END_TRANSFER".toByteArray())
+                    // mmOutStream.flush()
+
                     withContext(Dispatchers.Main) {
                         listener?.onFileTransferComplete(file.name, true)
+                        listener?.onMessage("Archivo '$fileName' enviado exitosamente. Total bytes: $totalBytesSent")
                     }
                 } catch (e: IOException) {
                     withContext(Dispatchers.Main) {
                         listener?.onFileTransferComplete(file.name, false)
                         listener?.onMessage("Error al enviar archivo: ${e.message}")
+                    }
+                } catch (e: InterruptedException) {
+                    withContext(Dispatchers.Main) {
+                        listener?.onFileTransferComplete(file.name, false)
+                        listener?.onMessage("Envío de archivo interrumpido: ${e.message}")
                     }
                 } finally {
                     try {
@@ -350,60 +364,111 @@ class BluetoothService(private val context: Context, private val uiHandler: Hand
             }
         }
 
-        private fun receiveFile(fileName: String) {
-            coroutineScope.launch {
-                withContext(Dispatchers.Main) {
-                    listener?.onFileTransferStarted(fileName)
-                }
+        // En ConnectedThread
 
-                var fileOutputStream: FileOutputStream? = null
+        // Nuevo método para leer un mensaje de encabezado completo (nombre + tamaño)
+// Esto es crucial porque `read()` puede no devolver el mensaje completo de una vez.
+        private fun readHeaderMessage(): String {
+            val stringBuilder = StringBuilder()
+            var byte: Int
+            // Leer byte por byte hasta encontrar un delimitador conocido o un tamaño máximo de encabezado
+            // Por simplicidad, asumimos que el encabezado es relativamente corto y el delimitador es '\n' o similar.
+            // Un protocolo más robusto enviaría primero la longitud del encabezado.
+            while (mmInStream.read().also { byte = it } != -1) {
+                val char = byte.toChar()
+                if (char == '\n') break // Usar un newline como terminador de encabezado
+                stringBuilder.append(char)
+                if (stringBuilder.length > 2048) { // Evitar leer indefinidamente si no hay '\n'
+                    throw IOException("Header message too long or missing terminator")
+                }
+            }
+            return stringBuilder.toString()
+        }
+
+        private fun receiveFile(headerMessage: String) {
+            coroutineScope.launch {
+                var fileName: String = "unknown_file"
+                var fileSize: Long = 0L
+
                 try {
+                    // Parsear el encabezado: "FILE_NAME:nombre.txt|FILE_SIZE:12345"
+                    val parts = headerMessage.split("|")
+                    val namePart = parts.find { it.startsWith("FILE_NAME:") }
+                    val sizePart = parts.find { it.startsWith("FILE_SIZE:") }
+
+                    fileName = namePart?.substringAfter("FILE_NAME:") ?: "unknown_file"
+                    fileSize = sizePart?.substringAfter("FILE_SIZE:")?.toLongOrNull() ?: 0L
+
+                    if (fileSize <= 0) {
+                        withContext(Dispatchers.Main) {
+                            listener?.onMessage("Error al recibir archivo '$fileName': Tamaño de archivo inválido o no especificado ($fileSize).")
+                            listener?.onFileTransferComplete(fileName, false)
+                        }
+                        return@launch // Salir de la coroutine
+                    }
+
+                    withContext(Dispatchers.Main) {
+                        listener?.onFileTransferStarted(fileName)
+                    }
+
                     val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                    if (!downloadsDir.exists()) downloadsDir.mkdirs() // Asegurarse de que el directorio existe
+                    if (!downloadsDir.exists()) downloadsDir.mkdirs()
                     val receivedFile = File(downloadsDir, fileName)
 
-                    fileOutputStream = FileOutputStream(receivedFile)
-                    var bytesRead: Int
-                    var totalBytesReceived: Long = 0
-                    val startTime = System.currentTimeMillis()
+                    var fileOutputStream: FileOutputStream? = null
+                    try {
+                        fileOutputStream = FileOutputStream(receivedFile)
+                        var bytesRead: Int
+                        var totalBytesReceived: Long = 0
+                        val bufferForReceive = ByteArray(4096) // Un buffer más grande
 
-                    // Un mecanismo para saber cuándo parar de leer. Esto es muy simplificado.
-                    // En un protocolo real, el emisor enviaría el tamaño total del archivo primero.
-                    // Aquí, simplemente esperamos a que no haya más datos o un timeout.
-                    while (mmInStream.read(buffer).also { bytesRead = it } != -1) {
-                        fileOutputStream.write(buffer, 0, bytesRead)
-                        totalBytesReceived += bytesRead
-                        // No podemos calcular un progreso fiable sin el tamaño total del archivo del emisor
-                        // Para un progreso real, el emisor DEBE enviar el tamaño del archivo primero
+                        // **PROTOCOLO:** Leer exactamente el fileSize
+                        while (totalBytesReceived < fileSize && coroutineScope.isActive) {
+                            val bytesToRead = (fileSize - totalBytesReceived).toInt().coerceAtMost(bufferForReceive.size)
+                            bytesRead = mmInStream.read(bufferForReceive, 0, bytesToRead)
+
+                            if (bytesRead == -1) { // Fin del stream inesperado (socket cerrado por el otro lado)
+                                throw IOException("Conexión perdida durante la recepción del archivo.")
+                            }
+                            if (bytesRead > 0) {
+                                fileOutputStream.write(bufferForReceive, 0, bytesRead)
+                                totalBytesReceived += bytesRead
+                                val progress = ((totalBytesReceived * 100) / fileSize).toInt()
+                                withContext(Dispatchers.Main) {
+                                    listener?.onFileTransferProgress(fileName, progress)
+                                }
+                            }
+                        }
+
+                        fileOutputStream.flush()
                         withContext(Dispatchers.Main) {
-                            listener?.onFileTransferProgress(fileName, 0) // No hay progreso real sin tamaño total
+                            listener?.onFileTransferComplete(fileName, true)
+                            listener?.onMessage("Archivo '$fileName' recibido en ${receivedFile.absolutePath}. Total bytes: $totalBytesReceived")
                         }
-                        // Simple timeout para evitar que siga leyendo indefinidamente
-                        if (System.currentTimeMillis() - startTime > 10000 && bytesRead == 0) { // Si no se lee nada en 10s
-                            break
+                    } catch (e: IOException) {
+                        withContext(Dispatchers.Main) {
+                            listener?.onFileTransferComplete(fileName, false)
+                            listener?.onMessage("Error al recibir archivo: ${e.message}")
+                        }
+                    } finally {
+                        try {
+                            fileOutputStream?.close()
+                        } catch (e: IOException) {
+                            e.printStackTrace()
                         }
                     }
-                    fileOutputStream.flush()
-                    withContext(Dispatchers.Main) {
-                        listener?.onFileTransferComplete(fileName, true)
-                        listener?.onMessage("Archivo '$fileName' recibido en ${receivedFile.absolutePath}")
-                    }
-                } catch (e: IOException) {
+                } catch (e: Exception) { // Capturar errores durante el parsing del encabezado o al iniciar la recepción
                     withContext(Dispatchers.Main) {
                         listener?.onFileTransferComplete(fileName, false)
-                        listener?.onMessage("Error al recibir archivo: ${e.message}")
-                    }
-                } finally {
-                    try {
-                        fileOutputStream?.close()
-                    } catch (e: IOException) {
-                        e.printStackTrace()
+                        listener?.onMessage("Error fatal al preparar la recepción del archivo '$fileName': ${e.message}")
                     }
                 }
             }
         }
 
+
         fun cancel() {
+            running = false // Establecer la bandera a false
             try {
                 mmSocket.close()
             } catch (e: IOException) {
